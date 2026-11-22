@@ -1,0 +1,29 @@
+{
+  "name": "dsh-wfk",
+  "version": "0.1.0",
+  "description": "issue-driven workflow discipline for dsh coding agents — ledger cards, tiered gates, evidence-bound completion (workflow-kit)",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "vendor",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "dshTarget": "0.2.1-rc.2",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "icon": "./icon.svg",
+  "license": "MIT"
+}

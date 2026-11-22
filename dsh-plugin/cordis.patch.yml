@@ -1,0 +1,8 @@
+# dsh-wfk bundle patch
+#
+# 只做一件事：把 wfk issue 工作流的纪律注入 dsh 编码 agent 的 system prompt。
+# 工具本体随包 vendor（纯 Python 标准库，零依赖），agent 用 shell 直接调用。
+
+- insert:
+    - id: wfk-protocol
+      name: dsh-wfk
