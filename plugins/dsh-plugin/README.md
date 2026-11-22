@@ -18,7 +18,7 @@ dsh（DeepSeek Harness）插件：把 [workflow-kit](https://github.com/baolongz
 
 ```bash
 cd ~/.dsh/profiles/desktop
-pnpm add --config.minimum-release-age=0 file:<本仓>/dsh-plugin
+pnpm add --config.minimum-release-age=0 file:<本仓>/plugins/dsh-plugin
 # 再把 "dsh-wfk" 追加进该 profile package.json 的 dsh.profile.bundles，重启 app
 ```
 
