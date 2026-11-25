@@ -6,8 +6,9 @@
 | `wfk list [--status in_progress] [--json]` | 列账本；`--json` 给机器 |
 | `wfk scan [--json]` | 巡检：待决策 / 在跑 / 卡住 / 写冲突 / 僵尸锁。`--json` 输出**不含时钟**，专供 cron monitor |
 | `wfk start <ID> [--owner dev-a]` | 建 `feat/<ID>` 分支 + worktree + 跑 bootstrap，状态转 `in_progress` |
-| `wfk gate <ID> g0\|g1\|g1.5\|g2\|g2.5 [--doc x.docx] [--template t.docx]` | 跑门禁；g1 按改动路径选测试子集；g2 自动取串行锁 |
+| `wfk gate <ID> g0\|g1\|g1.5\|g2\|g2.5 [--doc x.docx] [--template t.docx]` | 跑门禁；g1 按改动路径选测试子集；g2 自动取串行锁；`--doc` 省缺=账本卡自身，g2 层卡无 ```g2 块明确红（不是 skip） |
 | `wfk gate <ID> status` | **完成矩阵**：每层证据（含 tree/clean）、缺失原因、`ready_for_merge` |
+| `wfk calibrate <ID> [g2]` | 在当前树跑测量步骤落 `C:` CALIB 基线证据行：不判过/不过、不要求干净树；步骤带 `WFK_CALIBRATE=1`，harness 可切测量模式；合并闸复核 CALIB 必须测在**分支基树**（基线=改动前读数） |
 | `wfk merge <ID>` | 合并到默认分支；**自动解账本 md 冲突**（front-matter 取主仓保证据，正文取分支保决策记录）；代码冲突不自动解，直接拒绝 |
 | `wfk finish <ID>` | 关闭前检查（决策记录 / 验证证据 / 状态），不通过拒绝 |
 | `wfk finish <ID> --merged --cleanup` | `wfk merge` 之后收尾：置 `merged` + 移除 worktree + 回填 `merged_sha`；先验 `git merge-base --is-ancestor`，代码没进默认分支就拒绝 |
@@ -20,3 +21,19 @@
 | `wfk stats [--since D] [--json]` | kind 占比、缺视觉合并、回工率、中位墙钟、成本、盲评率。只读 |
 | `wfk selftest` | 跑 kit 自带测试（`tests/`，不依赖任何项目配置） |
 | `wfk init [--prefix XXX] [--force]` | 给任意 git 仓铺脚手架：`workflow.toml` + 账本 + `AGENTS.md` + `LOCKS.md`（gitignore 自动补） |
+
+## 辅助文件降噪（0.7.3，issue #6）
+
+`[[tests.aux]]` 声明"改动它们不该触发全量回退"的辅助文件与可选冒烟测试：
+
+```toml
+[[tests.aux]]
+scope = ".gitignore"          # glob，可多条
+tests = ["check.py"]          # 可选：改动全为 aux 时只跑这些冒烟
+
+[[tests.aux]]
+scope = "node_modules/three/**"   # 没配 tests：不触发回退，但仍全量（安全默认）
+```
+
+- aux 命中的文件不计入"未映射 → 回退全量"触发名单（混合改动里源码映射照常生效）；
+- 改动**全部**是 aux 且配了 `tests` → 只跑声明的冒烟；没配 → 仍全量并提示怎么降噪。

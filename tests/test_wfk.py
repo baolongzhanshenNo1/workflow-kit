@@ -158,13 +158,18 @@ class Base(unittest.TestCase):
         self.assertEqual(code, 0, out)
         ids = [p.name.split("-", 2)[0] + "-" + p.name.split("-", 2)[1]
                for p in (self.root / "docs/issues").glob("*.md") if p.name.startswith("T-")]
-        return sorted(ids, key=lambda x: int(x.split("-")[1]))[-1]
+        iid = sorted(ids, key=lambda x: int(x.split("-")[1]))[-1]
+        # 0.7.3（issue #2）：merge/finish 关卡预检要求 not_covered 非空非占位——夹具统一补真值
+        self.patch_meta(iid, not_covered='"自测卡不验：跨仓与发布面"')
+        return iid
 
     def new_started(self, kind="hygiene", scope="src/**") -> str:
         code, out = self.wfk("new", "用例", "--scope", scope, "--kind", kind,
                              "--verify", "A1: MANUAL: by=st how=人工核查 check.py 输出")
         self.assertEqual(code, 0, out)
         iid = re.search(r"created\s+\S*?(T-\d+)-", out).group(1)
+        # 0.7.3（issue #2）：同上——merge 关卡预检要求 not_covered 真值
+        self.patch_meta(iid, not_covered='"自测卡不验：跨仓与发布面"')
         if kind == "engine":
             self.patch_meta(iid, moves_metric='"clean43.pass_rate"')
         code, out = self.wfk("approve", iid)
@@ -276,15 +281,34 @@ class Base(unittest.TestCase):
         self.assertIn("ready_for_merge = True", out)
 
     def test_skip_not_counted(self):
-        """E-04：g2 缺 --doc 被 skip，不算 PASS（engine 类不得 ready）。"""
+        """E-04（0.7.3 演进，issue #5）：g2 不给 --doc 时自动用账本卡；无 g2 块的卡
+        在 g2 层是**明确红**（卡错误），不是 skip——旧 0.6.3 在这里静默 skip + exit 0，
+        `gate … g0 && … && gate g2` 一路绿过去，真跑的层没人发现。"""
         iid = self.new_started(kind="engine", scope="src/x.py")
         wt = self.wt(iid)
         self.wfk("gate", iid, "g1", cwd=wt)
-        code, out = self.wfk("gate", iid, "g2", cwd=wt)     # 不给 --doc
-        self.assertEqual(code, 0, out)
+        code, out = self.wfk("gate", iid, "g2", cwd=wt)     # 不给 --doc：自动解析卡路径
+        self.assertEqual(code, 1, out)
+        self.assertIn("没有 ```g2 块", out)
+        self.assertEqual(self.issue_meta(iid).get("status"), "in_progress")   # FAIL 不翻状态
         code, out = self.wfk("gate", iid, "status", cwd=wt)
         self.assertEqual(code, 2, out)
         self.assertIn("g2", out)
+
+    def test_g2_doc_autoresolve_runs_real_step(self):
+        """issue #5 正例：卡里有 ```g2 块 + 步骤用 {doc} + 不给 --doc → 自动拿卡路径真跑。"""
+        iid = self.new_started(kind="engine", scope="src/x.py")
+        wt = self.wt(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        # 往卡正文追加一个 g2 块（含阈值+基线对，满足 0.7.3 基线 lint）
+        card = next((self.root / "docs/issues").glob(f"{iid}-*.md"))
+        text = card.read_text(encoding="utf-8")
+        block = (NL + "```g2" + NL + "shots=0" + NL + "minLuma=0.10" + NL
+                 + "baseline.minLuma=0.33" + NL + 'baseline_source="夹具双仓探针"' + NL + "```" + NL)
+        card.write_text(text + block, encoding="utf-8")
+        code, out = self.wfk("gate", iid, "g2", cwd=wt)     # 不给 --doc
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASS", out)
 
     def test_empty_list_disables_visual_gate(self):
         """N-3：`visual_required_for = []` 是"关掉"，不是"回落到 engine"。"""
@@ -603,11 +627,14 @@ class Base(unittest.TestCase):
         self.assertEqual(len(evs), 1, "同提交重跑应覆盖证据行，而不是追加重复行")
 
     def test_merge_requires_log_pointer(self):
-        """0.6.0：PASS 证据指向的日志不存在（被清掉）→ 拒绝合并。"""
+        """0.6.0：PASS 证据指向的日志不存在（被清掉）→ 拒绝合并。
+        0.7.3：merge 关卡预检要读分支正文——先补正文再删日志。"""
         iid = self.new_started()
         wt = self.wt(iid)
         self.wfk("gate", iid, "g1", cwd=wt)
         self.assertEqual(self.issue_meta(iid).get("status"), "in_review")
+        self.fill_branch_body(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)         # 证据刷新到新 HEAD
         for p in (self.root / ".wf" / "gate").glob(f"{iid}-*.log"):
             p.unlink()
         code, out = self.wfk("merge", iid)
@@ -1151,3 +1178,192 @@ class Regression063(Base):
         self.assertEqual(code, 0, out)
         self.assertIn("T-0002", out)
         self.assertIn("既有内容", existing.read_text(encoding="utf-8"))
+
+    # ══ 0.7.3 断言质量包守卫（GitHub issues #1-#6 / WFK-0007）══
+
+    def test_validate_verification_vacuous_unit(self):
+        """issue #1 单元层：恒真/空体 lint 判定边界——approve/merge 两处共用这套。"""
+        sys.path.insert(0, str(WFK.parent))
+        import wfk  # noqa: PLC0415
+
+        probs = wfk.validate_verification(["A1: node @step:g1.check"])
+        self.assertTrue(any("恒真" in p for p in probs), probs)          # 空体：零参数
+        probs = wfk.validate_verification(["A2: {py} true @step:g1.check"])
+        self.assertTrue(any("恒真" in p for p in probs), probs)          # 恒真参数
+        probs = wfk.validate_verification(["A3: true @step:g1.check"])
+        self.assertTrue(any("绑定不了可跑命令" in p for p in probs), probs)  # 首词就不合法
+        self.assertEqual(wfk.validate_verification(["A1: {py} check.py @step:g1.check"]), [])
+        self.assertEqual(wfk.validate_verification(["A1: MANUAL: by=st how=人工"]), [])
+        self.assertEqual(wfk.validate_verification(["A1: git status @step:g0.status"]), [])
+
+    def test_vacuous_assertion_rejected_at_approve(self):
+        """issue #1 E2E：`A1: true` / 空体断言 approve 直接红；合法断言不误伤。"""
+        iid = self.new_issue("恒真断言", kind="hygiene", scope="src/x.py")
+        self.patch_meta(iid, verification='["A1: true @step:g1.check"]')
+        code, out = self.wfk("approve", iid)
+        self.assertEqual(code, 2, out)
+        iid = self.new_issue("空体断言", kind="hygiene", scope="src/x.py")
+        self.patch_meta(iid, verification='["A1: node @step:g1.check"]')
+        code, out = self.wfk("approve", iid)
+        self.assertEqual(code, 2, out)
+        self.assertIn("恒真", out)
+        iid = self.new_issue("合法断言", kind="hygiene", scope="src/x.py")
+        self.patch_meta(iid, verification='["A1: {py} check.py @step:g1.check"]')
+        code, out = self.wfk("approve", iid)
+        self.assertEqual(code, 0, out)
+
+    def test_merge_revalidates_assertion_body(self):
+        """issue #1 核心：approve 后把断言降级成 `A1: true`——merge 必须红。
+        0.6.3 的 assertion_coverage 只验 @step 绑定 + 步骤有 PASS，正文质量没人复查。"""
+        iid = self.new_started()
+        wt = self.wt(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        self.fill_branch_body(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        self.patch_meta(iid, verification='["A1: true @step:g1.check"]')   # approve 后降级
+        code, out = self.wfk("merge", iid)
+        self.assertEqual(code, 2, out)
+        self.assertIn("验收断言覆盖不通过", out)
+
+    def test_validate_close_not_covered_unit(self):
+        """issue #2 单元层：not_covered 空/占位/真值三态。"""
+        sys.path.insert(0, str(WFK.parent))
+        import wfk  # noqa: PLC0415
+
+        class _V:
+            meta: dict = {}
+            body: str = ""
+
+        v = _V()
+        v.body = ("## 决策记录" + NL + NL + "真实决策内容，超过二十个字，写成一句可核查的话。"
+                  + NL + NL + "## 验证证据" + NL + NL + "A1 真跑过，日志在 .wf/gate。")
+        v.meta = {"not_covered": ""}
+        self.assertTrue(any("not_covered" in p for p in wfk.validate_close(v)))
+        v.meta = {"not_covered": "（本卡故意不验什么——待填）"}
+        self.assertTrue(any("not_covered" in p for p in wfk.validate_close(v)))
+        v.meta = {"not_covered": "本卡不验：跨仓与发布面"}
+        self.assertFalse([p for p in wfk.validate_close(v) if "not_covered" in p])
+
+    def test_not_covered_required_at_merge(self):
+        """issue #2 E2E：分支卡 not_covered 空/占位 → merge 关卡预检红。"""
+        iid = self.new_started()
+        wt = self.wt(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        self.patch_meta(iid, not_covered='""')        # 掏空——branch 卡复制此刻主仓值
+        self.fill_branch_body(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        code, out = self.wfk("merge", iid)
+        self.assertEqual(code, 2, out)
+        self.assertIn("not_covered", out)
+        # 占位「（…）」同样不算数
+        self.patch_meta(iid, not_covered='"（本卡故意不验什么——待填）"')
+        self.fill_branch_body(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        code, out = self.wfk("merge", iid)
+        self.assertEqual(code, 2, out)
+        self.assertIn("not_covered", out)
+
+    def test_g2_baseline_lint_unit(self):
+        """issue #3 phase 1 单元层：阈值缺基线对红；补齐过；裸围栏同认；无阈值块豁免。"""
+        sys.path.insert(0, str(WFK.parent))
+        import wfk  # noqa: PLC0415
+
+        body_bad = NL.join(["```g2", "shots=1", "minFocusColors@1=3000", "```"])
+        probs = wfk.lint_g2_baseline(body_bad)
+        self.assertEqual(len(probs), 2, probs)      # 缺 baseline.<键> + 缺 baseline_source
+        body_ok = NL.join(["```g2", "shots=1", "minFocusColors@1=3000",
+                           "baseline.minFocusColors@1=1610",
+                           'baseline_source="双仓探针实测"', "```"])
+        self.assertEqual(wfk.lint_g2_baseline(body_ok), [])
+        body_bare = NL.join(["```", "g2", "maxLuma=0.85", "baseline.maxLuma=0.9",
+                             'baseline_source="x"', "```"])
+        self.assertEqual(wfk.lint_g2_baseline(body_bare), [])
+        self.assertEqual(wfk.lint_g2_baseline(NL.join(["```g2", "url=/x", "```"])), [])
+
+    def test_g2_baseline_required_at_approve(self):
+        """issue #3 phase 1 E2E：g2 块阈值无基线对 → approve 红；补齐放行。"""
+        iid = self.new_issue("阈值无基线", kind="engine", scope="src/x.py")
+        self.patch_meta(iid, moves_metric='"clean43.pass_rate"')
+        card = next((self.root / "docs/issues").glob(f"{iid}-*.md"))
+        text = card.read_text(encoding="utf-8")
+        card.write_text(text + NL + "```g2" + NL + "minColors=52000" + NL + "```" + NL,
+                        encoding="utf-8")
+        code, out = self.wfk("approve", iid)
+        self.assertEqual(code, 2, out)
+        self.assertIn("基线", out)
+        card.write_text(text + NL + "```g2" + NL + "minColors=52000" + NL
+                        + "baseline.minColors=48000" + NL
+                        + 'baseline_source="双仓探针"' + NL + "```" + NL, encoding="utf-8")
+        code, out = self.wfk("approve", iid)
+        self.assertEqual(code, 0, out)
+
+    def test_calibrate_writes_calib_evidence(self):
+        """issue #3 phase 2：calibrate 落 C: 证据行（不算 PASS）；基线测在非基树 → merge 红。"""
+        iid = self.new_started()
+        wt = self.wt(iid)
+        (wt / "src/x.py").write_text("# good" + NL + "# extra" + NL, encoding="utf-8")
+        self.commit_all("改动", cwd=wt)                 # 分支树离开基树
+        code, out = self.wfk("calibrate", iid, "g2", cwd=wt)
+        self.assertEqual(code, 0, out)
+        meta = self.issue_meta(iid)
+        calib = [e for e in meta.get("evidence") or [] if str(e).startswith("C:g2:")]
+        self.assertEqual(len(calib), 1, meta.get("evidence"))
+        self.assertIn("CALIB", calib[0])
+        # C: 行不贡献完成矩阵：必需层照旧缺证据（calibrate 不是 gate）
+        self.assertEqual(meta.get("status"), "in_progress")
+        code, out = self.wfk("gate", iid, "status", cwd=wt)
+        self.assertEqual(code, 2, out)
+        self.assertIn("g1", out)
+        self.assertIn("缺", out)
+        # 基线测在分支尖（≠基树）→ merge 必须红
+        self.wfk("gate", iid, "g1", cwd=wt)
+        self.fill_branch_body(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        code, out = self.wfk("merge", iid)
+        self.assertEqual(code, 2, out)
+        self.assertIn("CALIB", out)
+
+    def test_calibrate_at_base_tree_allows_merge(self):
+        """issue #3 phase 2 正例：基树上 calibrate（tree=基树）→ 合并闸放行。"""
+        iid = self.new_started()
+        wt = self.wt(iid)
+        code, out = self.wfk("calibrate", iid, "g2", cwd=wt)   # wt 尚无改动 = 基树
+        self.assertEqual(code, 0, out)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        self.fill_branch_body(iid)
+        self.wfk("gate", iid, "g1", cwd=wt)
+        code, out = self.wfk("merge", iid)
+        self.assertEqual(code, 0, out)
+
+    def test_aux_scope_quiets_fallback(self):
+        """issue #6：辅助文件改动不触发全量回退；配 aux tests 只跑冒烟；未配仍全量。"""
+        sys.path.insert(0, str(WFK.parent))
+        import wfk  # noqa: PLC0415
+
+        (self.root / "tests").mkdir(exist_ok=True)
+        (self.root / "tests/test_a.py").write_text("", encoding="utf-8")
+        (self.root / "tests/test_aux.py").write_text("", encoding="utf-8")
+        cfg = {"tests": {"default": "tests", "strict_map": True,
+                         "map": [{"scope": "src/**", "tests": ["tests/test_a.py"]}],
+                         "aux": [{"scope": ".gitignore", "tests": ["tests/test_aux.py"]},
+                                 {"scope": "node_modules/three/**"}]}}
+        self.assertEqual(wfk.pick_tests(self.root, cfg, self.root, [".gitignore"]),
+                         "tests/test_aux.py")
+        self.assertEqual(wfk.pick_tests(self.root, cfg, self.root,
+                                         ["node_modules/three/index.js"]), "tests")
+        self.assertEqual(wfk.pick_tests(self.root, cfg, self.root,
+                                         ["src/a.py", ".gitignore"]), "tests/test_a.py")
+        self.assertEqual(wfk.pick_tests(self.root, cfg, self.root, ["docs2/other.py"]),
+                         "tests")
+
+    def test_repo_cards_pass_new_lints(self):
+        """0.7.3 零误伤回归：本仓账本全部存量卡在新 lint 下仍绿。"""
+        sys.path.insert(0, str(WFK.parent))
+        import wfk  # noqa: PLC0415
+
+        cards = sorted((WFK.parent / "docs" / "issues").glob("WFK-*.md"))
+        self.assertTrue(cards, "存量卡必须存在——worktree 里漏了账本？")
+        for p in cards:
+            meta, body = wfk.parse_issue(p)
+            self.assertEqual(wfk.validate_verification(meta.get("verification")), [], p.name)
+            self.assertEqual(wfk.lint_g2_baseline(body), [], p.name)

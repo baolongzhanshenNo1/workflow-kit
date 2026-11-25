@@ -18,3 +18,32 @@
 | `[metrics]` 指标白名单 | **enforced** | `moves_metric` 必须是声明过的指标 |
 | 锁 | **enforced** | OS 互斥原语：同资源双持在原语层不可能，进程死自动释放 |
 | 端口 / 跨仓 / POSIX | **未实现** | 端口只打印提示；跨仓拆串行 issue；POSIX 无测试基质 |
+
+| 断言正文质量（恒真/空体 lint，approve + merge 双拦） | **enforced** | `A1: true` / `A1: node` 形状的装饰断言红；merge 侧重跑 approve 同款校验，approve 后降级改卡到此为止 |
+| `not_covered` 盲区声明 | **enforced** | 本卡故意不验什么——approve 展示、merge/finish 拦空值与「（…）」占位 |
+| g2 块阈值基线证据对 | **enforced** | `min*/max*` 阈值（含 per-shot 后缀 `minFocusColors@1`）必配 `baseline.<键>` + `baseline_source`；机器化走 `wfk calibrate`（`C:` CALIB 证据行，合并闸复核基线测在分支基树） |
+| `{doc}` 自解析 | **enforced** | 步骤命令缺 `--doc` 时自动用账本卡自身；g2 层卡无 ```g2 块 = 明确红，不是 skip |
+| `[[tests.aux]]` 辅助文件冒烟 | **enforced** | aux 命中文件不触发全量回退；改动全为 aux 且配了 tests 只跑冒烟；未配仍全量（安全默认） |
+
+## g2 卡块语法（规范，harness 作者照此实现）
+
+g2 块是卡正文里的围栏（两种形态都认：` ```g2 ` 语言围栏，或裸围栏 + 首行 `g2`）。步骤命令用 `{doc}` 拿到卡路径，harness 解析块内 `key = value`：
+
+```g2
+url=/?qa=world&seed=7
+warm=2.4
+shots=1            # 要断言的机位（shot 索引，逗号分隔）
+minColors=52000    # 全局阈值：作用于所有 shots
+minEdge=0.026
+minLuma=0.10
+maxLuma=0.85
+focus=0.135,0.615,0.215,0.685@1   # per-shot 绑定：@N 后缀 = 只对 shot N 断言
+minFocusColors@1=3000             # 阈值键同样支持 @N
+baseline.minFocusColors@1=1610    # 基线读数（改动前实测，lint 必查）
+baseline_source=双仓探针 imageStats，改动前树实测
+```
+
+- **全局键**：对每个 shot 都断言；
+- **`@N` 后缀键**：只对 shot 索引 N 断言——同一判别区在不同机位可能根本不在画面里，把阈值套到所有机位是伪断言（实测翻过车：无窗机位 colors=751 被 ≥3000 拦）；
+- **基线对**：块内出现任何 `min*`/`max*` 阈值时，必须有同键 `baseline.<键> = <数值>` 与非空 `baseline_source`（approve 与 merge 两处 lint）。基线读数怎么来见 `wfk calibrate`；
+- harness 侧只认自己声明的键，未知键忽略——规范向前兼容。
