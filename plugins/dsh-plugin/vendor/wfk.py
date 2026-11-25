@@ -25,7 +25,7 @@ from pathlib import Path
 
 import tomllib
 
-__version__ = "0.6.3"
+__version__ = "0.7.3"
 
 STATUSES = ["proposed", "approved", "in_progress", "in_review", "blocked", "merged", "dropped"]
 ACTIVE = {"approved", "in_progress", "in_review", "blocked"}
@@ -43,6 +43,15 @@ CMD_TOKENS = {
     "grep", "rg", "git", "make", "just", "uv", "curl",
 }
 ASSERT_RE = re.compile(r"^\s*A(\d+)\s*[:：]\s*(.+)$", re.S)
+
+# 0.7.3（GitHub issue #1）：恒真/空体断言的正文禁词——命令 token 合法但内容只剩这些，
+# 断言就是装饰。approve 与 merge 两处都按它红。
+VACUOUS_WORDS = {"true", "false", "ok", "pass", "passed", "fail", "skip",
+                 "yes", "no", "none", "nil", "null", "ok.", "绿", "通过", "通过。"}
+
+# 0.7.3（issue #4/#3）：g2 卡块围栏（```g2 语言围栏，或裸围栏 + 首行 g2）。
+G2_FENCE_RE = re.compile(r"```g2\s*\n(.*?)```", re.S)
+G2_BARE_RE = re.compile(r"```[^\n`]*\n\s*g2\s*\n(.*?)```", re.S)
 
 # 可信度加固（2026-11-18）：证据必须绑定「被测试的树 + 用过的尺子」。
 # 背景：外部评审 + 本人复现的三条 P0 绕过——脏工作区伪造 PASS、工人自带尺子、
@@ -169,6 +178,55 @@ def validate_verification(items) -> list[str]:
         token = words[0].strip("`") if words else ""
         if token not in CMD_TOKENS:
             problems.append(f"A{m.group(1)} 绑定不了可跑命令（首词 '{token}'）→ {body[:60]}")
+            continue
+        # 0.7.3（issue #1）：恒真/空体 lint——首词是合法命令但去掉 @step 绑定后没有
+        # 实际内容（零参数，或参数全是恒真词）的断言是装饰，approve/merge 都红。
+        _content = re.sub(r"@step:\s*[A-Za-z0-9_]+\.[A-Za-z0-9_-]+", "", body)
+        _content = re.sub(r"\s+", " ", _content).strip().strip("`")
+        _words = [w for w in _content.split() if w]
+        if len(_words) < 2 or all(w.lower() in VACUOUS_WORDS for w in _words[1:]):
+            problems.append(f"A{m.group(1)} 断言正文没有实际内容（恒真/空体）→ {body[:60]}")
+    return problems
+
+
+def g2_blocks_of(body: str) -> list[str]:
+    """取卡正文里的全部 g2 块（语言围栏与裸围栏两种形态都认）。"""
+    out = []
+    for m in G2_FENCE_RE.finditer(body or ""):
+        out.append(m.group(1))
+    for m in G2_BARE_RE.finditer(body or ""):
+        out.append(m.group(1))
+    return out
+
+
+def lint_g2_baseline(body: str) -> list[str]:
+    """0.7.3（issue #3 phase 1）：g2 块里的 min*/max* 阈值必须带基线证据对。
+
+    阈值没有基线读数就是先验拍脑袋——不可证伪。规则：
+      * 块内出现 `min*`/`max*` 阈值键（含 per-shot 后缀 `minFocusColors@1`，issue #4）
+        时，必须有同键 `baseline.<key> = <数值>`，且有一条非空 `baseline_source`；
+      * 没有 g2 块或块里没有阈值键的卡不受影响。
+    基线读数的机器化产出走 `wfk calibrate`（C: CALIB 证据行，合并闸复核其树）。
+    """
+    problems: list[str] = []
+    for block in g2_blocks_of(body):
+        kv: dict[str, str] = {}
+        for line in block.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            kv[k.strip()] = v.strip()
+        thresholds = [k for k in kv
+                      if (k.startswith("min") or k.startswith("max")) and not k.startswith("baseline.")]
+        if not thresholds:
+            continue
+        if not (kv.get("baseline_source") or "").strip():
+            problems.append("g2 块有阈值但没有 baseline_source（基线怎么测出来的必须写一行）")
+        for k in thresholds:
+            bv = (kv.get(f"baseline.{k}") or "").strip()
+            if not bv or not re.match(r"^-?\d+(\.\d+)?$", bv):
+                problems.append(f"g2 阈值 {k} 缺基线读数 → 补 baseline.{k} = <改动前实测值>")
     return problems
 
 
@@ -811,10 +869,17 @@ def pick_tests(root: Path, cfg: dict, wt: Path, files: list[str]) -> str:
              if not f.startswith('docs/') and f != 'workflow.toml']
     strict = bool((cfg.get('tests') or {}).get('strict_map', True))
     tdir = ((cfg.get('tests') or {}).get('dir') or 'tests').strip('/')
+    # 0.7.3（issue #6）：辅助文件白名单——.gitignore/LICENSE/依赖垫片这类改动不该触发
+    # 全量回退噪音。[[tests.aux]] 声明 scope（glob，可多条）与可选 tests（冒烟测试）：
+    #   * aux 命中的文件不计入"未映射 → 回退全量"的触发名单（安全语义对其它路径不变）；
+    #   * 改动**全部**是 aux 且有声明的冒烟 → 只跑冒烟；没声明 → 仍全量（安全默认）。
+    aux_entries = [e for e in (tcfg.get("aux") or []) if e.get("scope")]
+    aux_pats = [e["scope"] for e in aux_entries]
     if strict and picked:
         mapped_scopes = [e['scope'] for e in tcfg.get('map', [])]
         unmapped = [f for f in files
-                    if not match_any(f, mapped_scopes) and not match_any(f, [f'{tdir}/**'])]
+                    if not match_any(f, mapped_scopes) and not match_any(f, [f'{tdir}/**'])
+                    and not (aux_pats and match_any(f, aux_pats))]
         if unmapped:
             print(f"[tests] {len(unmapped)} 个改动文件不在 tests.map 覆盖内（如 {unmapped[:3]}）")
             print("[tests] 部分映射不可靠 → 回退默认全量。workflow.toml [tests].strict_map=false 可豁免（不推荐）")
@@ -824,6 +889,17 @@ def pick_tests(root: Path, cfg: dict, wt: Path, files: list[str]) -> str:
         picked.extend(expand(root, wt, tf))
     if picked:
         return " ".join(sorted(set(picked)))
+    # 0.7.3（issue #6）：路径映射未命中时，若改动全是 [[tests.aux]] 声明的辅助文件
+    # 且有配冒烟测试 → 只跑冒烟；没配 → 仍全量（安全默认，提示怎么降噪）。
+    if aux_pats and files and all(match_any(f, aux_pats) for f in files):
+        for e in aux_entries:
+            if any(match_any(f, [e["scope"]]) for f in files):
+                for pat in e.get("tests") or []:
+                    picked.extend(expand(root, wt, pat))
+        if picked:
+            print(f"[tests] 改动均为辅助文件 → 只跑 [[tests.aux]] 声明的冒烟（{len(set(picked))} 项）")
+            return " ".join(sorted(set(picked)))
+        print("[tests] 改动均为辅助文件但未配 aux tests → 仍跑全量（在 [[tests.aux]] 配 tests 可降噪）")
     # 映射没命中就是全量。**不要**再加关键词兜底：那会挑出一批与改动无关的测试。
     # 实测过一次：改的是 cli.py / api/agent_loop.py / pipeline/*，兜底选出 18 个 equation 测试
     # 跑出 115 passed 的假绿，真正的改动面一条都没测。
@@ -856,6 +932,7 @@ def cmd_new(args, root, cfg):
         "rework": 0,
         "moves_metric": getattr(args, "moves_metric", "") or "",
         "expected_delta": "",
+        "not_covered": "",  # 0.7.3（issue #2）：本卡故意不验什么——approve 展示、merge 必填非空
         "visual_skipped_by": "",
         "gate_config_change": "",
         "gate_config_approved_by": "",
@@ -1032,6 +1109,19 @@ def cmd_approve(args, root, cfg):
     if kind == "engine" and pol.get("require_metric_for_engine", True) and not (m.get("moves_metric") or "").strip():
         die(f"{iss.id} 是 engine 类却没有 moves_metric —— 这条改动想让哪个指标动？"
             f"补 `moves_metric = \"<指标名>\"`（真的不动就写 kind=\"hygiene\"）")
+    # 0.7.3（issue #3 phase 1）：g2 块的阈值必须带基线证据对——approve 时就拦，
+    # 不要等到 merge 才发现阈值是拍脑袋的。
+    g2lint = lint_g2_baseline(iss.body)
+    if g2lint:
+        die(f"{iss.id} 的 g2 块阈值缺基线证据对：\n  - "
+            + "\n  - ".join(g2lint)
+            + "\n  在 g2 块里补 baseline.<键> = <改动前实测值> 与 baseline_source；机器化走 wfk calibrate")
+    # 0.7.3（issue #2）：盲区显式化——approve 的人必须看见"本卡不验什么"。
+    nc = str(m.get("not_covered") or "").strip()
+    if nc:
+        print(f"  not_covered: {nc[:100]}")
+    else:
+        print("  not_covered: （空——开工前补一行：本卡故意不验什么；merge 时必填非空）")
     # 北星指标白名单（0.6.0）：moves_metric 必须是 [metrics] 声明过的真实指标。
     # 自由文本的后果：每条 issue 各造一个指标名，月度归因表对不上账（方案 §A1）。
     # 声明 `"xxx.*" = "…"` 表示接受该前缀（corpus.fail_cluster.<判定项> 这类派生指标）。
@@ -1199,7 +1289,18 @@ def run_step(root: Path, cfg: dict, wt: Path, iss: Issue, step: dict, doc: str =
             return _skip(f"不涉及 {step['when_scope']}")
     cmd = step["cmd"]
     if "{doc}" in cmd and not doc:
-        return _skip("需要 --doc")
+        # 0.7.3（issue #5）：卡就在账本目录里、issue 对象已在手——路径不用人喂。
+        # 旧行为是 skip + 命令链 exit 0，`wfk gate <id> g0 && … && g2` 会一路绿过去。
+        doc = str(iss.path)
+        if tier.startswith("g2") and not g2_blocks_of(iss.body or ""):
+            # 无 g2 块的卡在这层必然跑不出断言——明确红（配置/卡错误），不是 skip。
+            print(f"  FAIL {step['name']}：卡里没有 ```g2 块，{tier} 层无从断言（这是卡错误，不是 skip）")
+            ev = iss.meta.setdefault("evidence", [])
+            line = f"G:{tier or 'gate'}:{step['name']} FAIL reason=no-g2-block @{sha} cfg={cfgid}"
+            if line not in ev:
+                ev.append(line)
+                iss.save(meta=iss.meta)
+            return "fail"
     if "{template}" in cmd and not template:
         return _skip("需要 --template")
     files = changed_files(wt, default_branch(cfg, iss.meta.get("repo", "main"))) if wt.exists() else []
@@ -1423,8 +1524,12 @@ def assertion_coverage(iss: "Issue", cfg: dict, head: str, tree: str,
     '''验收断言覆盖（0.6.3/F12，评审 R19）：merge 时每条可执行断言必须绑定一个
     有当前树有效证据的门禁步骤（``@step:<层>.<步骤>``），或写成 MANUAL 回执。
     旧实现 merge 只看 gate 层覆盖率，验收断言本身是不是真跑过没人管。
+    0.7.3（issue #1）：**先复查断言正文质量再查绑定**——正文校验原来只在 approve 跑，
+    approve 之后卡是纯文本随手可改，`A1: true @step:g1.unit`（步骤真实存在）能一路绿；
+    现在把 validate_verification 在 merge 侧重跑，approve 后的降级改卡到此为止。
     '''
     problems: list[str] = []
+    problems.extend(validate_verification(iss.meta.get("verification")))
     for raw in iss.meta.get("verification") or []:
         text = str(raw)
         m = ASSERT_RE.match(text)
@@ -1510,7 +1615,17 @@ def validate_close_text(body: str) -> list[str]:
 
 def validate_close(iss: "Issue") -> list[str]:
     """关闭前必须齐的正文（合并前就要查，避免"代码进了主干、账本关不掉"）。"""
-    return validate_close_text(iss.body)
+    problems = validate_close_text(iss.body)
+    # 0.7.3（issue #2）：盲区显式化——not_covered 必须真写"本卡故意不验什么"。
+    # 占位约定与本仓一致：以「（」开头的未填模板、空串、敷衍词都不算数。
+    nc = str(iss.meta.get("not_covered") or "").strip()
+    bare = nc.lstrip("（(").strip().rstrip("）。)").strip()
+    if (not nc or nc.startswith("（") or nc.startswith("(") or not bare
+            or bare.lower() in {"无", "none", "n/a", "-", "待填", "略"}):
+        problems.append("not_covered 为空或敷衍——本卡故意不验什么，一行写出来（approve 的人要看）")
+    # 0.7.3（issue #3 phase 1）：g2 阈值必须带基线证据对。
+    problems.extend(lint_g2_baseline(iss.body))
+    return problems
 
 
 def gate_preflight(cfg: dict, iss: "Issue", wt: Path) -> None:
@@ -1678,6 +1793,69 @@ def cmd_verify(args, root, cfg):
     return 0 if ok_all else 1
 
 
+def cmd_calibrate(args, root, cfg):
+    """0.7.3（issue #3 phase 2）：在当前树上跑测量步骤，落 CALIB 证据行。
+
+    与 gate 的区别：**不判过/不过**（校准就是"把当前读数量下来"），不要求干净树
+    （量基线常发生在开工前/半途——门禁的 clean 指纹在这里没有意义）。步骤命令带
+    WFK_CALIBRATE=1，项目侧 harness 可据此切换测量输出模式。
+    证据行前缀 ``C:``——gate_evidence/完成矩阵只认 ``G:``，天然不混流。
+    合并闸只复核一件事：CALIB 行的 tree= 必须等于分支基树（基线必须是"改动前"读数）。
+    """
+    iss = load_issue_by_id(root, cfg, args.id)
+    wt = Path(iss.meta.get("worktree") or root)
+    gate_cfg = load_cfg(wt) if (wt / CFG_FILE).is_file() else cfg
+    tier = (args.tier or "g2").replace(".", "_")
+    steps = tier_steps(gate_cfg, tier)
+    if not steps:
+        die(f"[{tier}] 没有配置任何步骤——calibrate 测的就是这些步骤")
+    sha = short_sha(wt)
+    tree = tree_of(cfg, wt)
+    cfgid = cfg_blob(wt)
+    logdir = root / ".wf" / "gate"
+    logdir.mkdir(parents=True, exist_ok=True)
+    base = default_branch(cfg, iss.meta.get("repo", "main"))
+    files = changed_files(wt, base) if wt.exists() else []
+    for step in steps:
+        cmd = step["cmd"]
+        if "{tests}" in cmd:
+            cmd = cmd.replace("{tests}", pick_tests(root, gate_cfg, wt, files))
+        cmd = (cmd.replace("{py}", f'"{venv_python(root)}"')
+               .replace("{doc}", f'"{args.doc or iss.path}"')
+               .replace("{template}", f'"{getattr(args, "template", "") or ""}"')
+               .replace("{issue}", f'"{iss.path}"')
+               .replace("{id}", iss.id)
+               .replace("{wt}", f'"{wt}"')
+               .replace("{root}", f'"{root}"'))
+        runid = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        log = logdir / f"{iss.id}-{step['name']}-calibrate-{runid}.log"
+        env = dict(os.environ, WFK_CALIBRATE="1", PYTHONIOENCODING="utf-8")
+        for k, v in (step.get("env") or {}).items():
+            if v == "":
+                env.pop(k, None)
+            else:
+                env[k] = str(v)
+        print(f"[calibrate:{tier}] {step['name']}: {cmd}")
+        with open(log, "w", encoding="utf-8", errors="replace") as fh:
+            try:
+                rc = subprocess.run(cmd, shell=True, cwd=str(wt), stdin=subprocess.DEVNULL,
+                                    stdout=fh, stderr=subprocess.STDOUT, env=env,
+                                    timeout=step.get("timeout") or None).returncode
+            except subprocess.TimeoutExpired:
+                fh.write("\n[wfk] calibrate 超时——按步骤 timeout 放宽或拆分测量\n")
+                rc = -1
+        print(f"[calibrate:{tier}] {step['name']} rc={rc} → {log.relative_to(root)}")
+        ev = iss.meta.setdefault("evidence", [])
+        line = (f"C:{tier}:{step['name']} CALIB @{sha} tree={tree} cfg={cfgid} "
+                f"log={log.relative_to(root).as_posix()}")
+        ev[:] = [e for e in ev if not str(e).startswith(f"C:{tier}:{step['name']} ")]
+        ev.append(line)
+        iss.save(meta=iss.meta)
+    print(f"[calibrate] 完成。把测量读数写进卡：baseline.<键> = <实测值> + baseline_source = <怎么测的>")
+    print(f"[calibrate] 合并闸将复核 CALIB 行的 tree= 是否为分支基树（基线必须是改动前读数）")
+    return 0
+
+
 def _git(rp: Path, *args: str):
     """跑 git；stdin=DEVNULL 防止任何交互式提问把进程挂住。
 
@@ -1733,6 +1911,18 @@ def _resolve_ledger_conflict(rp: Path, rel_issue: str, target: Path, out_scope: 
     r = _git(rp, 'commit', '-q', '--no-edit')
     if r.returncode != 0:
         die('提交合并失败：' + (r.stderr or r.stdout))
+
+
+def card_at(repo: Path, rev: str, rel: str):
+    """读某提交里的账本卡（不落盘）；读不到返回 None。"""
+    r = _git(repo, "show", f"{rev}:{rel}")
+    if r.returncode != 0 or not r.stdout.startswith(FM):
+        return None
+    try:
+        _, fm, body = r.stdout.split(FM, 2)
+        return tomllib.loads(fm), body
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def cmd_merge(args, root, cfg):
@@ -1843,6 +2033,32 @@ def cmd_merge(args, root, cfg):
         die(f"{iss.id} 验收断言覆盖不通过：" + chr(10) + "  - "
             + chr(10) + "  - ".join(_acov)
             + chr(10) + "  可执行断言补 @step:<层>.<步骤> 绑定并跑 wfk gate，或改写 MANUAL: by= how= 回执")
+
+    # 0.7.3（issue #2/#3）：关卡预检上移到 merge——validate_close 原来只在 finish 跑，
+    # 代码已进主干才发现"账本关不掉"为时已晚。not_covered 与 g2 基线对在这里就拦。
+    # 正文取**分支版**卡（两套协作惯例都覆盖：正文改主仓时分支版与主仓一致）。
+    _close_view = None
+    if rel_issue:
+        _at = card_at(rp, branch, rel_issue)
+        if _at:
+            class _CardView:  # noqa: D401 - 轻量只读视图
+                pass
+            _close_view = _CardView()
+            _close_view.meta, _close_view.body = _at
+    _close_problems = validate_close(_close_view if _close_view is not None else iss)
+    if _close_problems:
+        die(f"{iss.id} 关卡预检不通过（合并前就要齐，避免代码进主干、账本关不掉）：\n  - "
+            + "\n  - ".join(_close_problems)
+            + "\n  补齐：决策记录/验证证据正文 + not_covered（本卡不验什么）+ g2 基线对")
+
+    # 0.7.3（issue #3 phase 2）：CALIB 基线证据必须测在分支基树上——基线的语义就是
+    # "改动前读数"；在分支尖上 calibrate 等于把阈值对齐到改动后的自己，基线失去意义。
+    _calib = [str(e) for e in (iss.meta.get("evidence") or []) if str(e).startswith("C:")]
+    if _calib:
+        _base_tree = tree_of(cfg, rp, base)
+        if not any(f"tree={_base_tree}" in c for c in _calib):
+            die(f"{iss.id} 的 CALIB 基线证据不在分支基树（期望 tree={_base_tree}）——"
+                f"基线必须是改动前读数：在基树上 wfk calibrate {iss.id} 重测。")
     for w in waived:
         print(f"[warn] {w}")
 
@@ -2308,9 +2524,17 @@ def main(argv=None):
     p.add_argument("tier", nargs="?",
                    help="g0/g1/g1.5/g2/g3…（跑指定层）或 status（打印完成矩阵）；"
                         "不给则按 required_tiers 跑必需层")
-    p.add_argument("--doc", help="G2 需要的文档路径（模板见 --template）")
+    p.add_argument("--doc", help="G2 文档路径；省缺=账本卡自身（工具已持有 issue 对象）")
     p.add_argument("--template", help="G2 需要的模板路径；步骤里用 {template} 占位")
     p.set_defaults(fn=cmd_gate)
+
+    p = sub.add_parser("calibrate", help="在当前树跑测量步骤落 CALIB 基线证据行（不判过/不过）")
+    p.add_argument("id")
+    p.add_argument("tier", nargs="?", default="g2",
+                   help="要测量的层（默认 g2）")
+    p.add_argument("--doc", help="测量文档路径；省缺=账本卡自身")
+    p.add_argument("--template", help="模板路径；步骤里用 {template} 占位")
+    p.set_defaults(fn=cmd_calibrate)
 
     p = sub.add_parser("verify", help="跑全局验证（语料 + 全量），不绑 issue")
     p.add_argument("--only", help="只跑指定步骤（逗号分隔，如 corpus,full）")

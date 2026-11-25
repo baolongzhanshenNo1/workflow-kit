@@ -67,6 +67,7 @@ status = "proposed"
 kind = "process"
 write_scope = []
 budget_tokens = 60000
+not_covered = "（本卡故意不验什么——approve 展示、merge 必填非空）"
 verification = []
 +++
 
@@ -77,6 +78,8 @@ verification = []
 ## 验收断言
 
 A1: {{py}} -m pytest -q tests @step:g1.pytest
+
+（g2 卡块带阈值时必须配基线对：baseline.<键> = <改动前实测值> + baseline_source；机器化走 wfk calibrate。）
 
 ## 触达路径
 
